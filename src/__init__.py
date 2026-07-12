@@ -1,0 +1,1 @@
+"""Household power forecasting project."""
