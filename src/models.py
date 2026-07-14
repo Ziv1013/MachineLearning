@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class PositionalEncoding(nn.Module):
@@ -128,8 +129,8 @@ class TransformerForecaster(nn.Module):
         return self.head(pooled)
 
 
-class BayesFormerUQForecaster(nn.Module):
-    """Transformer with Bayesian dropout and quantile outputs."""
+class WeatherBayesFormerUQForecaster(nn.Module):
+    """Weather-gated decomposition Transformer with quantile outputs."""
 
     is_quantile_model = True
 
@@ -144,13 +145,31 @@ class BayesFormerUQForecaster(nn.Module):
         dropout: float = 0.15,
         quantiles: tuple[float, ...] = (0.1, 0.5, 0.9),
         max_len: int = 512,
+        weather_start: int = 15,
+        weather_dim: int = 5,
+        trend_window: int = 7,
     ) -> None:
         super().__init__()
         self.horizon = horizon
+        self.weather_start = weather_start
+        self.weather_dim = weather_dim
+        self.trend_window = trend_window
         self.num_quantiles = len(quantiles)
         self.median_index = min(range(self.num_quantiles), key=lambda i: abs(quantiles[i] - 0.5))
         self.register_buffer("quantiles", torch.tensor(quantiles, dtype=torch.float32), persistent=False)
-        self.input_proj = nn.Linear(input_dim, d_model)
+        self.input_proj = nn.Linear(input_dim + 2, d_model)
+        self.weekly_patch = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.weather_gate = nn.Sequential(
+            nn.LayerNorm(weather_dim),
+            nn.Linear(weather_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
         self.position = nn.Parameter(torch.zeros(1, max_len, d_model))
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -173,7 +192,24 @@ class BayesFormerUQForecaster(nn.Module):
 
     def forward(self, x: torch.Tensor, future_x: torch.Tensor) -> torch.Tensor:
         del future_x
-        z = self.input_proj(x) + self.position[:, : x.size(1)]
+        target = x[:, :, :1]
+        pad = self.trend_window // 2
+        trend = F.avg_pool1d(
+            F.pad(target.transpose(1, 2), (pad, pad), mode="replicate"),
+            kernel_size=self.trend_window,
+            stride=1,
+        ).transpose(1, 2)
+        residual = target - trend
+        x_aug = torch.cat([x, trend, residual], dim=-1)
+
+        z = self.input_proj(x_aug)
+        z = z + self.weekly_patch(z.transpose(1, 2)).transpose(1, 2)
+        if x.size(-1) >= self.weather_start + self.weather_dim:
+            weather_context = x[:, :, self.weather_start : self.weather_start + self.weather_dim].mean(dim=1)
+        else:
+            weather_context = torch.zeros(x.size(0), self.weather_dim, device=x.device, dtype=x.dtype)
+        weather_gate = self.weather_gate(weather_context).unsqueeze(1)
+        z = z * (1.0 + weather_gate) + self.position[:, : x.size(1)]
         encoded = self.encoder(z)
         encoded = self.bayesian_dropout(encoded)
         pooled = torch.cat([encoded[:, -1], encoded.mean(dim=1)], dim=1)
@@ -206,8 +242,8 @@ def build_model(
             d_model=d_model,
             use_future_decoder=use_future_decoder,
         )
-    if name in {"bayes_former_uq", "bayesformer_uq", "bayesian_transformer_uq", "bayesformer"}:
-        return BayesFormerUQForecaster(
+    if name in {"weather_bayesformer_uq", "weatherbayesformer_uq", "weather_bayesformer"}:
+        return WeatherBayesFormerUQForecaster(
             input_dim=input_dim,
             horizon=horizon,
             future_dim=future_dim,

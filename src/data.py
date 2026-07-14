@@ -126,6 +126,8 @@ class PreparedData:
     future_dim: int
     target_mode: str
     baseline_mode: str
+    scaler_fit_end: int
+    validation_target_start: int
 
 
 def load_daily_data(path: Path) -> pd.DataFrame:
@@ -175,25 +177,31 @@ def prepare_data(
     if train_end <= input_len + horizon:
         raise ValueError("Training split is too short for the requested input and horizon.")
 
+    validation_days = max(horizon, int(np.ceil(train_end * val_fraction)))
+    validation_target_start = train_end - validation_days
+    if validation_target_start <= input_len + horizon:
+        raise ValueError("Training segment is too short for a leakage-safe validation block.")
+
     feature_scaler = StandardScaler()
     target_scaler = StandardScaler()
-    feature_scaler.fit(df.loc[: train_end - 1, feature_columns])
-    target_scaler.fit(df.loc[: train_end - 1, [TARGET_COLUMN]])
+    scaler_fit_end = validation_target_start
+    feature_scaler.fit(df.loc[: scaler_fit_end - 1, feature_columns])
+    target_scaler.fit(df.loc[: scaler_fit_end - 1, [TARGET_COLUMN]])
 
     features = feature_scaler.transform(df[feature_columns]).astype(np.float32)
     future_features = feature_scaler.transform(df[feature_columns])[
         :, [feature_columns.index(c) for c in future_columns]
     ].astype(np.float32)
     target = target_scaler.transform(df[[TARGET_COLUMN]]).astype(np.float32)
-    baseline = build_seasonal_baseline(df, train_end, target_scaler).astype(np.float32)
+    baseline = build_seasonal_baseline(df, scaler_fit_end, target_scaler).astype(np.float32)
 
     train_starts = np.arange(0, train_end - input_len - horizon + 1)
-    split = max(1, int(len(train_starts) * (1.0 - val_fraction)))
-    fit_starts = train_starts[:split]
-    val_starts = train_starts[split:]
-    if len(val_starts) == 0:
-        val_starts = train_starts[-1:]
-        fit_starts = train_starts[:-1]
+    target_starts = train_starts + input_len
+    target_ends = target_starts + horizon
+    fit_starts = train_starts[target_ends <= validation_target_start]
+    val_starts = train_starts[target_starts >= validation_target_start]
+    if len(fit_starts) == 0 or len(val_starts) == 0:
+        raise ValueError("Could not construct non-overlapping fit and validation targets.")
 
     first_test_start = train_end - input_len
     last_test_start = len(df) - input_len - horizon
@@ -254,6 +262,8 @@ def prepare_data(
         future_dim=len(future_columns),
         target_mode=target_mode,
         baseline_mode=baseline_mode,
+        scaler_fit_end=scaler_fit_end,
+        validation_target_start=validation_target_start,
     )
 
 

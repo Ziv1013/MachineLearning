@@ -26,6 +26,8 @@ SUM_COLUMNS = [
 MEAN_COLUMNS = ["voltage", "global_intensity"]
 WEATHER_COLUMNS = ["RR", "NBJRR1", "NBJRR5", "NBJRR10", "NBJBROU"]
 EPSILON = 1e-6
+SCEAUX_LAT = 48.7786
+SCEAUX_LON = 2.2906
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -65,6 +67,11 @@ def load_minute_data(raw_path: Path) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Preserve coverage before filling. The archive keeps every internal
+    # timestamp but leaves some measurement cells empty.
+    df["global_active_power_observed"] = df["global_active_power"].notna().astype(int)
+    df[numeric_cols] = df[numeric_cols].ffill().fillna(0.0)
+
     # Formula given in the assessment. It is computed per minute before daily
     # aggregation so the feature remains physically meaningful.
     df["sub_metering_remainder"] = (
@@ -75,15 +82,29 @@ def load_minute_data(raw_path: Path) -> pd.DataFrame:
     return df.dropna(subset=["datetime"]).sort_values("datetime")
 
 
+def _haversine_km(lat: pd.Series, lon: pd.Series) -> pd.Series:
+    lat1 = np.radians(SCEAUX_LAT)
+    lon1 = np.radians(SCEAUX_LON)
+    lat2 = np.radians(lat.astype(float))
+    lon2 = np.radians(lon.astype(float))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * 6371.0 * np.arcsin(np.sqrt(a))
+
+
 def load_monthly_weather(weather_paths: list[Path]) -> pd.DataFrame | None:
     frames = []
-    usecols = ["AAAAMM", *WEATHER_COLUMNS]
+    usecols = ["NUM_POSTE", "NOM_USUEL", "LAT", "LON", "AAAAMM", *WEATHER_COLUMNS]
     for path in weather_paths:
         if not path.exists():
             continue
         weather = pd.read_csv(path, sep=";", usecols=lambda col: col in usecols)
         if "AAAAMM" not in weather.columns:
             continue
+        for col in ["NUM_POSTE", "NOM_USUEL", "LAT", "LON"]:
+            if col not in weather.columns:
+                weather[col] = np.nan
         for col in WEATHER_COLUMNS:
             if col not in weather.columns:
                 weather[col] = np.nan
@@ -95,11 +116,31 @@ def load_monthly_weather(weather_paths: list[Path]) -> pd.DataFrame | None:
         return None
 
     monthly = pd.concat(frames, ignore_index=True)
-    monthly = monthly.dropna(subset=["AAAAMM"])
+    monthly = monthly.dropna(subset=["AAAAMM", "LAT", "LON"])
     monthly["year_month"] = monthly["AAAAMM"].astype(int).astype(str)
-    monthly = monthly.groupby("year_month", as_index=False)[WEATHER_COLUMNS].median()
-    monthly[WEATHER_COLUMNS] = monthly[WEATHER_COLUMNS].interpolate().ffill().bfill()
-    return monthly
+    monthly["distance_km"] = _haversine_km(monthly["LAT"], monthly["LON"])
+    monthly = monthly.sort_values(["year_month", "distance_km", "NUM_POSTE"])
+
+    # The UCI household is in Sceaux. Météo-France files contain many stations,
+    # so for each month and variable we use the geographically nearest station
+    # with an available observation, instead of averaging unrelated districts.
+    records = []
+    for year_month, group in monthly.groupby("year_month", sort=True):
+        row: dict[str, float | str] = {"year_month": year_month}
+        for col in WEATHER_COLUMNS:
+            valid = group.dropna(subset=[col])
+            row[col] = np.nan if valid.empty else float(valid.iloc[0][col])
+        records.append(row)
+
+    selected = pd.DataFrame(records).sort_values("year_month").reset_index(drop=True)
+    selected[WEATHER_COLUMNS] = selected[WEATHER_COLUMNS].ffill().fillna(0.0)
+
+    # Monthly climate aggregates are only fully known after the month closes.
+    # Shift each observation to the following month so every daily feature is
+    # available at prediction time instead of leaking the rest of that month.
+    source_month = pd.PeriodIndex(selected["year_month"], freq="M")
+    selected["year_month"] = (source_month + 1).astype(str).str.replace("-", "", regex=False)
+    return selected
 
 
 def add_weather_features(daily: pd.DataFrame, monthly_weather: pd.DataFrame | None) -> None:
@@ -110,7 +151,7 @@ def add_weather_features(daily: pd.DataFrame, monthly_weather: pd.DataFrame | No
     merged = daily[["year_month"]].merge(monthly_weather, on="year_month", how="left")
     for col in WEATHER_COLUMNS:
         values = pd.to_numeric(merged[col], errors="coerce")
-        daily[col] = values.interpolate().ffill().bfill().to_numpy()
+        daily[col] = values.ffill().fillna(0.0).to_numpy()
     daily.drop(columns=["year_month"], inplace=True)
 
 
@@ -125,9 +166,13 @@ def build_daily_table(
     grouped = df.groupby("date")
     daily_sum = grouped[SUM_COLUMNS].sum(min_count=1)
     daily_mean = grouped[MEAN_COLUMNS].mean()
-    valid_minutes = grouped["global_active_power"].count().rename("valid_minutes")
-    daily = pd.concat([daily_sum, daily_mean], axis=1).reset_index()
-    daily = daily.merge(valid_minutes.reset_index(), on="date", how="left")
+    valid_minutes = grouped["global_active_power_observed"].sum().rename("valid_minutes")
+    timestamp_count = grouped.size().rename("timestamp_count")
+    daily = pd.concat([daily_sum, daily_mean, valid_minutes, timestamp_count], axis=1).reset_index()
+
+    # The archive begins and ends partway through a day. Those boundary days
+    # cannot represent a complete daily total and are excluded.
+    daily = daily.loc[daily["timestamp_count"] == 1440].copy()
 
     value_cols = SUM_COLUMNS + MEAN_COLUMNS
     low_coverage = daily["valid_minutes"] < min_daily_points
@@ -138,8 +183,11 @@ def build_daily_table(
     daily = daily.set_index("date").reindex(all_days)
     daily.index.name = "date"
 
-    daily[value_cols] = daily[value_cols].interpolate(method="time").ffill().bfill()
+    # Causal imputation: a missing/low-coverage day can only reuse information
+    # already observed on or before that day.
+    daily[value_cols] = daily[value_cols].ffill().fillna(0.0)
     daily["valid_minutes"] = daily["valid_minutes"].fillna(0).astype(int)
+    daily["timestamp_count"] = daily["timestamp_count"].fillna(0).astype(int)
 
     idx = daily.index
     daily["day_of_week"] = idx.dayofweek

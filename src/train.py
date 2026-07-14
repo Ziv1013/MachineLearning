@@ -17,7 +17,7 @@ from .data import PreparedData, inverse_target, prepare_data
 from .models import build_model
 
 
-MODEL_NAMES = ["lstm", "transformer", "bayes_former_uq"]
+MODEL_NAMES = ["lstm", "transformer", "weather_bayesformer_uq"]
 HORIZONS = [90, 365]
 
 
@@ -67,7 +67,7 @@ def train_one(
     weight_decay: float,
     patience: int,
     device: torch.device,
-) -> tuple[nn.Module, float]:
+) -> tuple[nn.Module, float, int, int]:
     model.to(device)
     train_loader = DataLoader(data.train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(data.val_ds, batch_size=batch_size, shuffle=False)
@@ -76,9 +76,12 @@ def train_one(
 
     best_state = None
     best_val = float("inf")
+    best_epoch = 0
+    epochs_ran = 0
     stale = 0
 
     for _epoch in range(1, epochs + 1):
+        epochs_ran = _epoch
         model.train()
         for x, future_x, _baseline, y in train_loader:
             x = x.to(device)
@@ -93,6 +96,7 @@ def train_one(
         val_loss = evaluate_loss(model, val_loader, loss_fn, device)
         if val_loss < best_val:
             best_val = val_loss
+            best_epoch = _epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             stale = 0
         else:
@@ -102,7 +106,7 @@ def train_one(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, best_val
+    return model, best_val, best_epoch, epochs_ran
 
 
 @torch.no_grad()
@@ -130,24 +134,59 @@ def predict(
     device: torch.device,
     target_mode: str,
     return_aux: bool = False,
+    mc_samples: int = 1,
 ):
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    use_mc = bool(getattr(model, "is_quantile_model", False) and mc_samples > 1)
     model.eval()
+    if use_mc:
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                module.train()
     preds = []
     truths = []
+    lowers = []
+    uppers = []
     baselines = []
     inputs = []
     for x, future_x, baseline, y in loader:
-        raw_output = model(x.to(device), future_x.to(device))
-        raw_pred = median_prediction(raw_output, model).cpu().numpy()
+        x_device = x.to(device)
+        future_device = future_x.to(device)
+        if use_mc:
+            outputs = torch.stack(
+                [model(x_device, future_device) for _ in range(mc_samples)],
+                dim=0,
+            )
+            quantiles = getattr(model, "quantiles")
+            median_index = int(getattr(model, "median_index"))
+            lower_index = int(torch.argmin(torch.abs(quantiles - 0.1)).item())
+            upper_index = int(torch.argmin(torch.abs(quantiles - 0.9)).item())
+            median_samples = outputs[..., median_index]
+            raw_pred_tensor = median_samples.mean(dim=0)
+            raw_lower_tensor = torch.quantile(outputs[..., lower_index], 0.1, dim=0)
+            raw_upper_tensor = torch.quantile(outputs[..., upper_index], 0.9, dim=0)
+            raw_lower_tensor = torch.minimum(raw_lower_tensor, raw_pred_tensor)
+            raw_upper_tensor = torch.maximum(raw_upper_tensor, raw_pred_tensor)
+            raw_pred = raw_pred_tensor.cpu().numpy()
+            raw_lower = raw_lower_tensor.cpu().numpy()
+            raw_upper = raw_upper_tensor.cpu().numpy()
+        else:
+            raw_output = model(x_device, future_device)
+            raw_pred = median_prediction(raw_output, model).cpu().numpy()
         baseline_np = baseline.numpy()
         y_np = y.numpy()
         if target_mode == "residual":
             preds.append(raw_pred + baseline_np)
             truths.append(y_np + baseline_np)
+            if use_mc:
+                lowers.append(raw_lower + baseline_np)
+                uppers.append(raw_upper + baseline_np)
         elif target_mode == "level":
             preds.append(raw_pred)
             truths.append(y_np)
+            if use_mc:
+                lowers.append(raw_lower)
+                uppers.append(raw_upper)
         else:
             raise ValueError(f"Unknown target mode: {target_mode}")
         if return_aux:
@@ -155,11 +194,15 @@ def predict(
             inputs.append(x.numpy())
     pred_arr = np.concatenate(preds)
     truth_arr = np.concatenate(truths)
+    model.eval()
     if return_aux:
         aux = {
             "baseline": np.concatenate(baselines),
             "input": np.concatenate(inputs),
         }
+        if use_mc:
+            aux["lower"] = np.concatenate(lowers)
+            aux["upper"] = np.concatenate(uppers)
         return pred_arr, truth_arr, aux
     return pred_arr, truth_arr
 
@@ -234,30 +277,219 @@ def apply_linear_calibration(pred: np.ndarray, aux: dict[str, np.ndarray], coefs
     return calibrated
 
 
-def plot_prediction(
+def plot_seed_ensemble_prediction(
     dates: list[str],
     truth: np.ndarray,
-    pred: np.ndarray,
+    predictions: np.ndarray,
     model_name: str,
     horizon: int,
-    seed: int,
+    seeds: np.ndarray,
     out_path: Path,
+    mc_lowers: np.ndarray | None = None,
+    mc_uppers: np.ndarray | None = None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(12, 4.8), dpi=150)
+    prediction_mean = predictions.mean(axis=0)
+    prediction_std = predictions.std(axis=0, ddof=1) if len(predictions) > 1 else np.zeros_like(prediction_mean)
+
+    plt.figure(figsize=(13.5, 5.4), dpi=170)
     x = np.arange(len(dates))
-    plt.plot(x, truth, label="Ground Truth", linewidth=2)
-    plt.plot(x, pred, label="Prediction", linewidth=2)
+    if mc_lowers is not None and mc_uppers is not None:
+        plt.fill_between(
+            x,
+            mc_lowers.mean(axis=0),
+            mc_uppers.mean(axis=0),
+            color="0.55",
+            alpha=0.18,
+            label="Mean MC-quantile interval",
+        )
+    plt.fill_between(
+        x,
+        prediction_mean - prediction_std,
+        prediction_mean + prediction_std,
+        color="tab:orange",
+        alpha=0.22,
+        label="5-seed mean +/- 1 std",
+    )
+    plt.plot(x, truth, label="Ground Truth", linewidth=2, color="tab:blue")
+    plt.plot(
+        x,
+        prediction_mean,
+        label="5-seed mean prediction",
+        linewidth=2,
+        color="tab:orange",
+    )
     tick_count = min(8, len(dates))
     ticks = np.linspace(0, len(dates) - 1, tick_count, dtype=int)
     plt.xticks(ticks, [dates[i] for i in ticks], rotation=25, ha="right")
-    plt.title(f"{model_name} horizon={horizon} seed={seed}")
+    display_name = {
+        "lstm": "LSTM",
+        "transformer": "Transformer",
+        "weather_bayesformer_uq": "WeatherBayesFormerUQ",
+    }.get(model_name, model_name)
+    seed_text = ", ".join(str(seed) for seed in seeds)
+    plt.title(f"{display_name} horizon={horizon}, five-seed ensemble ({seed_text})")
     plt.xlabel("Date")
-    plt.ylabel("Daily global active power")
+    plt.ylabel("Daily total global active power (kW)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def aggregate_overlapping_windows(windows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if windows.ndim != 2:
+        raise ValueError(f"Expected [window, horizon] values, got shape {windows.shape}.")
+    window_count, horizon = windows.shape
+    calendar_length = window_count + horizon - 1
+    sums = np.zeros(calendar_length, dtype=np.float64)
+    counts = np.zeros(calendar_length, dtype=np.int32)
+    for window_index, values in enumerate(windows):
+        target_slice = slice(window_index, window_index + horizon)
+        sums[target_slice] += values
+        counts[target_slice] += 1
+    means = sums / counts
+    squared_deviations = np.zeros(calendar_length, dtype=np.float64)
+    for window_index, values in enumerate(windows):
+        target_slice = slice(window_index, window_index + horizon)
+        deviations = values.astype(np.float64) - means[target_slice]
+        squared_deviations[target_slice] += deviations * deviations
+    variances = np.zeros(calendar_length, dtype=np.float64)
+    multiple = counts > 1
+    variances[multiple] = squared_deviations[multiple] / (counts[multiple] - 1)
+    return means.astype(np.float32), np.sqrt(np.maximum(variances, 0.0)).astype(np.float32)
+
+
+def plot_all_rolling_windows(
+    first_window_dates: list[str],
+    truth_windows: np.ndarray,
+    predictions_by_model: dict[str, np.ndarray],
+    horizon: int,
+    seeds: np.ndarray,
+    out_path: Path,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    window_count = truth_windows.shape[0]
+    calendar_length = window_count + horizon - 1
+    calendar_dates = pd.date_range(
+        start=pd.Timestamp(first_window_dates[0]),
+        periods=calendar_length,
+        freq="D",
+    ).strftime("%Y-%m-%d").tolist()
+    calendar_truth, truth_overlap_std = aggregate_overlapping_windows(truth_windows)
+    if not np.allclose(truth_overlap_std, 0.0, rtol=0.0, atol=1e-5):
+        raise ValueError("Overlapping test windows contain inconsistent ground truth values.")
+
+    model_order = [name for name in MODEL_NAMES if name in predictions_by_model]
+    figure, axes = plt.subplots(
+        len(model_order),
+        1,
+        figsize=(14.5, 11.5),
+        dpi=170,
+        sharex=True,
+        sharey=True,
+    )
+    axes = np.atleast_1d(axes)
+    display_names = {
+        "lstm": "LSTM",
+        "transformer": "Transformer",
+        "weather_bayesformer_uq": "WeatherBayesFormerUQ",
+    }
+    for axis, model_name in zip(axes, model_order):
+        seed_predictions = predictions_by_model[model_name]
+        window_predictions = seed_predictions.mean(axis=0)
+        overlap_mean, _ = aggregate_overlapping_windows(window_predictions)
+        for window_index, values in enumerate(window_predictions):
+            x = np.arange(window_index, window_index + horizon)
+            axis.plot(x, values, color="tab:orange", alpha=0.055, linewidth=0.65)
+        axis.plot(
+            np.arange(calendar_length),
+            calendar_truth,
+            color="tab:blue",
+            linewidth=1.8,
+            label="Ground Truth",
+            zorder=3,
+        )
+        axis.plot(
+            np.arange(calendar_length),
+            overlap_mean,
+            color="darkorange",
+            linewidth=2.0,
+            label="Mean across overlapping forecast origins",
+            zorder=4,
+        )
+        axis.plot([], [], color="tab:orange", alpha=0.35, linewidth=1.2, label="Rolling forecasts")
+        axis.set_title(display_names.get(model_name, model_name))
+        axis.set_ylabel("Daily total power (kW)")
+        axis.grid(alpha=0.16)
+        axis.legend(loc="best", fontsize=8)
+
+    tick_count = min(8, calendar_length)
+    ticks = np.linspace(0, calendar_length - 1, tick_count, dtype=int)
+    axes[-1].set_xticks(ticks, [calendar_dates[index] for index in ticks], rotation=25, ha="right")
+    axes[-1].set_xlabel("Target date")
+    seed_text = ", ".join(str(seed) for seed in seeds)
+    figure.suptitle(
+        f"All {window_count} rolling {horizon}-day test forecasts; five-seed means ({seed_text})",
+        fontsize=14,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    figure.savefig(out_path)
+    plt.close(figure)
+
+
+def plot_summary_table(summary: pd.DataFrame, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    display = summary[
+        [
+            "model",
+            "horizon",
+            "normalized_mse_mean",
+            "normalized_mse_std",
+            "normalized_mae_mean",
+            "normalized_mae_std",
+            "mae_kw_mean",
+        ]
+    ].copy()
+    display.columns = [
+        "Model",
+        "Horizon",
+        "Norm MSE",
+        "Norm MSE Std",
+        "Norm MAE",
+        "Norm MAE Std",
+        "MAE (kW)",
+    ]
+    display["Model"] = display["Model"].replace(
+        {"weather_bayesformer_uq": "WeatherBayesFormerUQ", "transformer": "Transformer", "lstm": "LSTM"}
+    )
+    for column in ["Norm MSE", "Norm MSE Std", "Norm MAE", "Norm MAE Std", "MAE (kW)"]:
+        display[column] = display[column].map(lambda value: f"{value:.4f}")
+
+    fig, ax = plt.subplots(figsize=(14, 3.8), dpi=160)
+    ax.axis("off")
+    table = ax.table(
+        cellText=display.values,
+        colLabels=display.columns,
+        cellLoc="center",
+        colLoc="center",
+        loc="center",
+        colWidths=[0.23, 0.08, 0.13, 0.13, 0.13, 0.13, 0.13],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.0, 1.55)
+    for (row, _column), cell in table.get_celld().items():
+        cell.set_edgecolor("#9aa0a6")
+        if row == 0:
+            cell.set_facecolor("#e8eef7")
+            cell.set_text_props(weight="bold")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f7f8fa")
+    ax.set_title("Five-seed normalized errors with daily-power-scale MAE", fontsize=13, pad=12)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def dataframe_to_markdown(df: pd.DataFrame, floatfmt: str = ".4f") -> str:
@@ -284,25 +516,58 @@ def dataframe_to_markdown(df: pd.DataFrame, floatfmt: str = ".4f") -> str:
 
 def write_report(summary: pd.DataFrame, metrics: pd.DataFrame, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    table = dataframe_to_markdown(summary, floatfmt=".4f")
+    point_columns = [
+        "model",
+        "horizon",
+        "normalized_mse_mean",
+        "normalized_mse_std",
+        "normalized_mae_mean",
+        "normalized_mae_std",
+        "mse_kw2_mean",
+        "mae_kw_mean",
+        "rmse_kw_mean",
+        "runs",
+        "fit_windows",
+        "val_windows",
+        "test_windows",
+    ]
+    table = dataframe_to_markdown(summary[point_columns], floatfmt=".4f")
+    uq_rows = summary.loc[
+        summary["model"] == "weather_bayesformer_uq",
+        [
+            "horizon",
+            "picp_80_mean",
+            "picp_80_std",
+            "mpiw_80_kw_mean",
+            "mpiw_80_kw_std",
+            "mc_samples",
+        ],
+    ]
+    uq_table = dataframe_to_markdown(uq_rows, floatfmt=".4f")
     best_rows = (
-        summary.sort_values(["horizon", "mse_mean"])
+        summary.sort_values(["horizon", "normalized_mse_mean"])
         .groupby("horizon")
-        .head(1)[["horizon", "model", "mse_mean", "mae_mean"]]
+        .head(1)[
+            ["horizon", "model", "normalized_mse_mean", "normalized_mae_mean", "mae_kw_mean"]
+        ]
     )
     best_table = dataframe_to_markdown(best_rows, floatfmt=".4f")
     figure_block = """
-![LSTM 90-day prediction](../outputs/figures/lstm_h90_seed42.png)
+![Five-seed result summary](../outputs/figures/summary_results.png)
 
-![Transformer 90-day prediction](../outputs/figures/transformer_h90_seed42.png)
+![LSTM 90-day five-seed mean prediction](../outputs/figures/lstm_h90_5seed_mean.png)
 
-![BayesFormerUQ 90-day prediction](../outputs/figures/bayes_former_uq_h90_seed42.png)
+![Transformer 90-day five-seed mean prediction](../outputs/figures/transformer_h90_5seed_mean.png)
 
-![LSTM 365-day prediction](../outputs/figures/lstm_h365_seed42.png)
+![WeatherBayesFormerUQ 90-day five-seed mean prediction](../outputs/figures/weather_bayesformer_uq_h90_5seed_mean.png)
 
-![Transformer 365-day prediction](../outputs/figures/transformer_h365_seed42.png)
+![All rolling 90-day test forecasts](../outputs/figures/all_windows_h90_5seed_mean.png)
 
-![BayesFormerUQ 365-day prediction](../outputs/figures/bayes_former_uq_h365_seed42.png)
+![LSTM 365-day five-seed mean prediction](../outputs/figures/lstm_h365_5seed_mean.png)
+
+![Transformer 365-day five-seed mean prediction](../outputs/figures/transformer_h365_5seed_mean.png)
+
+![WeatherBayesFormerUQ 365-day five-seed mean prediction](../outputs/figures/weather_bayesformer_uq_h365_5seed_mean.png)
 """.strip()
     body = f"""# 2026年专硕机器学习课程项目实验报告
 
@@ -314,11 +579,11 @@ GitHub链接：待填写
 
 ## 1. 问题介绍
 
-本项目面向家庭电力消耗的多变量时间序列预测任务。原始数据来自 UCI Individual household electric power consumption 数据集，记录法国一户家庭从 2006-12 到 2010-11 的分钟级用电数据。按照课程要求，本文将分钟级数据汇总为日级序列，使用过去 90 天的多变量历史曲线预测未来 90 天和 365 天的 `global_active_power` 变化曲线。
+本项目面向家庭总有功功率的多变量时间序列预测任务。原始数据来自 UCI Individual household electric power consumption 数据集，记录法国一户家庭从 2006-12 到 2010-11 的分钟级用电数据。按照课程要求，本文对每一天的 `global_active_power` 分钟记录直接求和，形成日总有功功率序列；使用过去 90 天的多变量历史曲线预测未来 90 天和 365 天中每一天的总有功功率。
 
-预处理遵循题目要求：`global_active_power`、`global_reactive_power`、`sub_metering_1`、`sub_metering_2`、`sub_metering_3` 和 `sub_metering_remainder` 按天求和，`voltage`、`global_intensity` 按天求均值。天气字段 `RR`、`NBJRR1`、`NBJRR5`、`NBJRR10` 和 `NBJBROU` 来自 data.gouv 的 Météo-France 月度气候数据，按年月映射到每日样本；同一月份多站点记录取中位数，等价于题目要求中“取当天任意一个可用数据”的日级处理。缺失值先转为 NaN，再在日级序列上做时间插值和前后向填充。为了让模型感知周期性，还加入星期、月份和年内日的正余弦编码。
+预处理遵循题目要求：有功功率、无功功率和分表字段按天求和，电压和电流按天求均值，不把总有功功率换算成用电量。分钟缺失值只使用过去观测前向填充，低覆盖日复用前一完整日，采集首尾不足 1440 分钟的边界日被排除。天气字段来自距离 Sceaux 最近的可用站点；月度气候汇总整体滞后一个月后映射到每日样本，确保预测起点只使用已经结束月份的信息。
 
-在基础特征之外，本文进一步构造了不泄漏未来信息的历史统计特征，包括前 1/7/30 天滞后值、7 天与 30 天滚动均值和标准差、指数滑动均值、日差分、当前值相对滚动均值的偏离量，以及有功/无功、电流/功率和分表总量等比例特征。短期预测更依赖近期状态，因此 90 天预测使用特征增强配置；365 天长期预测中，部分滞后和滚动特征会削弱跨季节泛化，因此保留各模型重复实验中更稳定、MSE 更低的配置。
+正式模型统一使用 36 个历史特征，包括原始日级电力、日历编码、滞后月度天气、滞后值、滚动统计、指数均值、差分及比例特征。所有模型只接收过去 90 天的信息。
 
 ## 2. 模型
 
@@ -328,13 +593,21 @@ LSTM 模型使用循环结构编码历史依赖，取最后一层隐藏状态经
 
 Transformer 模型先将多变量输入映射到隐藏维度，叠加正弦位置编码，再通过 Transformer Encoder 建模不同日期之间的全局依赖。输出端拼接最后时刻表示和均值池化表示，增强对短期状态和整体趋势的刻画。
 
-改进模型 BayesFormerUQ 以 Transformer Encoder 为主干，在编码结果后加入 Bayesian Dropout，并使用分位数回归同时预测 0.1、0.5 和 0.9 三个分位数。训练时采用 quantile loss，并额外加入 0.5 分位数的点预测损失以兼顾 MSE 和 MAE；测试时使用 0.5 分位数作为最终预测曲线，0.1 到 0.9 分位数可解释为预测不确定区间。该结构的动机是：未来 90 天尤其是 365 天用电存在较强不确定性，直接输出单一点估计容易过度平滑或对随机尖峰敏感，而分位数建模能同时表达趋势和不确定性。
+改进模型 WeatherBayesFormerUQ 在 Transformer Encoder 前加入 7 日趋势--残差分解、7 日卷积和历史天气门控，并输出 0.1/0.5/0.9 分位数。测试时保持显式 Dropout 层激活并进行 30 次 MC 采样；点预测取 MC 中位数预测的均值，区间下界取 q0.1 输出在 MC 样本间的 0.1 分位数，上界取 q0.9 输出的 0.9 分位数。
 
 伪代码如下：
 
 ```text
 X = last_90_days_multivariate_features
-Z = Linear(X) + learnable_positional_encoding
+power = X[:, global_active_power]
+trend = MovingAverage(power, window=7)
+residual = power - trend
+X_aug = concat(X, trend, residual)
+Z = Linear(X_aug)
+Z = Z + WeeklyPatchConv1D(Z, kernel_size=7)
+weather = mean(X[:, [RR, NBJRR1, NBJRR5, NBJRR10, NBJBROU]], time)
+gate = sigmoid(MLP(weather))
+Z = Z * (1 + gate) + learnable_positional_encoding
 H = TransformerEncoder(Z)
 H = BayesianDropout(H)
 context = concat(H_last, mean_pool(H))
@@ -344,27 +617,31 @@ y_hat = Q[:, q50]
 
 ## 3. 结果与分析
 
-评价指标为 MSE 和 MAE。每个模型在每个预测长度上运行 5 个随机种子，报告均值和标准差。本次正式实验使用 30 个训练 epoch，隐藏维度为 64，batch size 主要为 128。BayesFormerUQ 输出多个分位数，表中的 MSE 和 MAE 使用 0.5 分位数预测曲线计算。early stopping 的 patience 设为 30，以便三类模型都经过较充分训练。
+所有训练损失都在标准化目标空间计算：LSTM/Transformer 优化 MSE，WeatherBayesFormerUQ 优化分位数复合损失；评价时三者统一使用标准化 MSE/MAE。同时将输出反标准化并报告课程日总功率尺度上的 MSE、MAE 和 RMSE。每个模型在每个预测长度上运行 5 个随机种子，报告均值和标准差。拟合与验证目标日期完全分离，Scaler 仅在验证目标开始前的数据上拟合。正式实验使用 30 epochs、隐藏维度 64、batch size 128、AdamW 和 patience 30，并将每次最佳验证权重保存到 `outputs/checkpoints`。
 
 {table}
+
+WeatherBayesFormerUQ 的 MC--分位数区间指标如下。PICP80 是真实值落入区间的比例，MPIW80 是日总功率尺度上的平均区间宽度；该区间同时反映分位数输出与 Dropout 采样变化，是否达到名义 80% 覆盖由 PICP80 检验。
+
+{uq_table}
 
 各预测长度下 MSE 最低的模型如下：
 
 {best_table}
 
-从结果看，30 轮训练和特征工程后，三类模型都能捕捉日级用电曲线的主要趋势。90 天预测中 Transformer 的 MSE 最低，BayesFormerUQ 的 MAE 最低且标准差更小，说明分位数回归的中位预测在短期任务中更稳健。365 天预测中 LSTM 的点预测 MSE 和 MAE 最低，说明在样本量有限的情况下，循环结构对长期平滑趋势仍有优势。BayesFormerUQ 的点预测误差不是最低，但它能同时输出 0.1、0.5 和 0.9 分位数，将未来长期预测中的不确定性显式表达出来；即使极端尖峰无法被完全还原，也能通过分位数区间给出风险范围。
+归一化误差便于与使用相同标准化定义的实验比较，反标准化指标则对应题目规定的日总有功功率尺度。由于同一预测长度中的各模型共享训练集 Scaler，两种尺度的模型排序完全一致；不同数据划分、不同 Scaler 或不同窗口口径下的归一化数字不能直接比较。
 
 需要注意的是，日级真实曲线存在大量尖峰和突发低谷。虽然模型已经加入历史天气变量，但仍没有家庭行为、节假日安排和未来日级天气预报等更细粒度外部信息，因此预测线仍比 Ground Truth 更平滑。这种差异不代表模型完全失效，而是多步预测在缺少未来外部信息时常见的均值回归现象。
 
-预测曲线如下，均使用 seed=42 的模型输出作为代表性可视化。365 天预测只有 1 个完整测试窗口，因此该任务的稳定性主要由 5 个随机种子的重复实验来衡量。
+预测曲线同时采用两种展示口径。单窗口图中，每条橙色实线是随机种子 42--46 的逐日预测均值，橙色窄阴影是五个种子预测的均值加减一个样本标准差；WeatherBayesFormerUQ 的灰色宽阴影是五个种子各自 30 次 MC 采样所得分位数上下界的逐日均值。90 天全窗口图则展示全部 276 个滚动测试窗口：每条浅橙线是一个窗口在五个种子上的平均预测，深橙线是同一日期所收到的不同预测起点结果的均值，蓝线是真值。365 天测试段只有 1 个完整窗口，因此不存在与单窗口不同的全窗口重叠图。表格指标仍按每个种子的完整测试集单独计算后再汇总，不使用图中的集成均值重新计算指标。
 
 {figure_block}
 
 ## 4. 讨论
 
-本项目使用公开 UCI 电力数据和 data.gouv 月度气候数据自行构造日级训练和测试集。由于链接中没有直接给出划分好的 `train.csv` 与 `tes.csv`，本文按时间顺序划分数据，将最后 365 天作为测试集，其余日期用于训练和验证。这种划分方式避免了随机划分导致的未来信息泄漏，也符合时间序列预测的使用场景。
+本项目按时间顺序划分，将最后 365 天作为测试集。拟合目标与验证目标之间不重叠，缺失值只做因果前向填充，月度天气滞后一个月；因此预处理和模型选择均不使用预测起点之后的信息。90 天测试仍采用 rolling-origin 口径，同一日期在不同提前量下可被评价多次。
 
-改进方向包括：使用递归式或分段式多步预测降低 365 天直接输出难度；加入分解模块分别建模趋势、季节和残差；针对峰值负荷使用加权损失；对不同季节分层采样以提升长期稳定性。
+当前限制包括月度天气粒度较粗、365 天验证和测试各只有一个完整窗口，以及 MC--分位数区间尚未校准。归一化误差依赖训练集均值和标准差，因此报告同时保留反标准化误差。后续可使用逐日天气预报、滚动年度交叉验证和 conformal calibration。
 
 工具说明：报告初稿可使用 ChatGPT/Codex 辅助整理，但实验代码、数据处理和结果应以本仓库可复现输出为准。
 
@@ -390,10 +667,13 @@ y_hat = Q[:, q50]
 def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     rows = []
+    ensemble_records: dict[tuple[str, int], list[dict[str, object]]] = {}
     output_dir = Path(args.output_dir)
     figure_dir = output_dir / "figures"
     checkpoint_dir = output_dir / "checkpoints"
+    prediction_dir = output_dir / "predictions"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    prediction_dir.mkdir(parents=True, exist_ok=True)
 
     for horizon in args.horizons:
         data = prepare_data(
@@ -416,7 +696,7 @@ def run(args: argparse.Namespace) -> None:
                     d_model=args.d_model,
                     use_future_decoder=args.use_future_decoder,
                 )
-                model, val_loss = train_one(
+                model, val_loss, best_epoch, epochs_ran = train_one(
                     model=model,
                     data=data,
                     epochs=args.epochs,
@@ -426,6 +706,27 @@ def run(args: argparse.Namespace) -> None:
                     patience=args.patience,
                     device=device,
                 )
+                checkpoint_path = checkpoint_dir / f"{model_name}_h{horizon}_seed{seed}.pt"
+                torch.save(
+                    {
+                        "model_state_dict": {
+                            key: value.detach().cpu() for key, value in model.state_dict().items()
+                        },
+                        "model": model_name,
+                        "horizon": horizon,
+                        "seed": seed,
+                        "input_dim": data.input_dim,
+                        "future_dim": data.future_dim,
+                        "d_model": args.d_model,
+                        "best_epoch": best_epoch,
+                        "val_loss_scaled": val_loss,
+                        "feature_columns": data.feature_columns,
+                    },
+                    checkpoint_path,
+                )
+                active_mc_samples = (
+                    args.mc_samples if getattr(model, "is_quantile_model", False) else 1
+                )
                 pred_scaled, true_scaled, test_aux = predict(
                     model,
                     data.test_ds,
@@ -433,6 +734,7 @@ def run(args: argparse.Namespace) -> None:
                     device,
                     data.target_mode,
                     return_aux=True,
+                    mc_samples=active_mc_samples,
                 )
                 if args.calibrate:
                     val_pred_scaled, val_true_scaled, val_aux = predict(
@@ -445,20 +747,79 @@ def run(args: argparse.Namespace) -> None:
                     )
                     coefs = fit_linear_calibration(val_pred_scaled, val_true_scaled, val_aux)
                     pred_scaled = apply_linear_calibration(pred_scaled, test_aux, coefs)
+                    if "lower" in test_aux:
+                        test_aux["lower"] = apply_linear_calibration(
+                            test_aux["lower"], test_aux, coefs
+                        )
+                        test_aux["upper"] = apply_linear_calibration(
+                            test_aux["upper"], test_aux, coefs
+                        )
                 pred = inverse_target(data.target_scaler, pred_scaled)
                 truth = inverse_target(data.target_scaler, true_scaled)
+                lower = (
+                    inverse_target(data.target_scaler, test_aux["lower"])
+                    if "lower" in test_aux
+                    else None
+                )
+                upper = (
+                    inverse_target(data.target_scaler, test_aux["upper"])
+                    if "upper" in test_aux
+                    else None
+                )
 
-                mse = mean_squared_error(truth.reshape(-1), pred.reshape(-1))
-                mae = mean_absolute_error(truth.reshape(-1), pred.reshape(-1))
+                ensemble_records.setdefault((model_name, horizon), []).append(
+                    {
+                        "seed": seed,
+                        "dates": np.asarray(data.test_dates),
+                        "truth": truth.copy(),
+                        "prediction": pred.copy(),
+                        "lower": lower.copy() if lower is not None else None,
+                        "upper": upper.copy() if upper is not None else None,
+                    }
+                )
+
+                normalized_mse = mean_squared_error(
+                    true_scaled.reshape(-1), pred_scaled.reshape(-1)
+                )
+                normalized_mae = mean_absolute_error(
+                    true_scaled.reshape(-1), pred_scaled.reshape(-1)
+                )
+                mse_kw2 = mean_squared_error(truth.reshape(-1), pred.reshape(-1))
+                mae_kw = mean_absolute_error(truth.reshape(-1), pred.reshape(-1))
+                rmse_kw = float(np.sqrt(mse_kw2))
+                picp_80 = (
+                    float(np.mean((truth >= lower) & (truth <= upper)))
+                    if lower is not None and upper is not None
+                    else np.nan
+                )
+                mpiw_80_kw = (
+                    float(np.mean(upper - lower))
+                    if lower is not None and upper is not None
+                    else np.nan
+                )
                 rows.append(
                     {
                         "model": model_name,
                         "horizon": horizon,
                         "seed": seed,
-                        "mse": mse,
-                        "mae": mae,
+                        "normalized_mse": normalized_mse,
+                        "normalized_mae": normalized_mae,
+                        "mse_kw2": mse_kw2,
+                        "mae_kw": mae_kw,
+                        "rmse_kw": rmse_kw,
+                        "picp_80": picp_80,
+                        "mpiw_80_kw": mpiw_80_kw,
                         "val_loss_scaled": val_loss,
+                        "best_epoch": best_epoch,
+                        "epochs_ran": epochs_ran,
+                        "fit_windows": len(data.train_ds),
+                        "val_windows": len(data.val_ds),
                         "test_windows": len(data.test_ds),
+                        "scaler_fit_end": data.scaler_fit_end,
+                        "validation_target_start": data.validation_target_start,
+                        "target_mean_kw": float(data.target_scaler.mean_[0]),
+                        "target_std_kw": float(data.target_scaler.scale_[0]),
+                        "mc_samples": active_mc_samples,
                         "features": json.dumps(data.feature_columns),
                         "future_features": json.dumps(data.future_columns),
                         "target_mode": data.target_mode,
@@ -472,19 +833,109 @@ def run(args: argparse.Namespace) -> None:
                 )
                 print(
                     f"model={model_name} horizon={horizon} seed={seed} "
-                    f"mse={mse:.4f} mae={mae:.4f}"
+                    f"norm_mse={normalized_mse:.4f} norm_mae={normalized_mae:.4f} "
+                    f"mae_kw={mae_kw:.4f} rmse_kw={rmse_kw:.4f} "
+                    f"picp80={picp_80:.4f} mpiw80_kw={mpiw_80_kw:.4f}"
                 )
 
-                if seed == args.seeds[0]:
-                    plot_prediction(
-                        dates=data.test_dates,
-                        truth=truth[0],
-                        pred=pred[0],
-                        model_name=model_name,
-                        horizon=horizon,
-                        seed=seed,
-                        out_path=figure_dir / f"{model_name}_h{horizon}_seed{seed}.png",
-                    )
+    rolling_predictions: dict[int, dict[str, np.ndarray]] = {}
+    rolling_truths: dict[int, np.ndarray] = {}
+    rolling_dates: dict[int, list[str]] = {}
+    rolling_seeds: dict[int, np.ndarray] = {}
+    for (model_name, horizon), records in sorted(ensemble_records.items()):
+        records.sort(key=lambda item: int(item["seed"]))
+        seeds = np.asarray([int(item["seed"]) for item in records])
+        dates = np.asarray(records[0]["dates"])
+        truths = np.stack([np.asarray(item["truth"]) for item in records])
+        predictions = np.stack([np.asarray(item["prediction"]) for item in records])
+        if not all(np.array_equal(dates, np.asarray(item["dates"])) for item in records):
+            raise ValueError(f"Test dates differ across seeds for {model_name}, horizon={horizon}.")
+        if not np.allclose(truths, truths[0], rtol=0.0, atol=1e-6):
+            raise ValueError(f"Ground truth differs across seeds for {model_name}, horizon={horizon}.")
+
+        has_mc_interval = all(
+            item["lower"] is not None and item["upper"] is not None for item in records
+        )
+        mc_lowers = (
+            np.stack([np.asarray(item["lower"]) for item in records])
+            if has_mc_interval
+            else None
+        )
+        mc_uppers = (
+            np.stack([np.asarray(item["upper"]) for item in records])
+            if has_mc_interval
+            else None
+        )
+        first_window_truths = truths[:, 0, :]
+        first_window_predictions = predictions[:, 0, :]
+        first_window_mc_lowers = mc_lowers[:, 0, :] if mc_lowers is not None else None
+        first_window_mc_uppers = mc_uppers[:, 0, :] if mc_uppers is not None else None
+        output_stem = f"{model_name}_h{horizon}_5seed_mean"
+        plot_seed_ensemble_prediction(
+            dates=dates.tolist(),
+            truth=first_window_truths[0],
+            predictions=first_window_predictions,
+            model_name=model_name,
+            horizon=horizon,
+            seeds=seeds,
+            out_path=figure_dir / f"{output_stem}.png",
+            mc_lowers=first_window_mc_lowers,
+            mc_uppers=first_window_mc_uppers,
+        )
+        calendar_length = predictions.shape[1] + horizon - 1
+        calendar_dates = pd.date_range(
+            start=pd.Timestamp(dates[0]),
+            periods=calendar_length,
+            freq="D",
+        ).strftime("%Y-%m-%d").to_numpy(dtype="<U10")
+        calendar_truth, _ = aggregate_overlapping_windows(truths[0])
+        overlap_prediction_mean, overlap_prediction_std = aggregate_overlapping_windows(
+            predictions.mean(axis=0)
+        )
+        payload = {
+            "dates": dates,
+            "truth": first_window_truths[0],
+            "seeds": seeds,
+            "predictions_by_seed": first_window_predictions,
+            "prediction_mean": first_window_predictions.mean(axis=0),
+            "prediction_std": (
+                first_window_predictions.std(axis=0, ddof=1)
+                if len(first_window_predictions) > 1
+                else np.zeros_like(first_window_predictions[0])
+            ),
+            "window_truth": truths[0],
+            "window_predictions_by_seed": predictions,
+            "window_prediction_mean": predictions.mean(axis=0),
+            "calendar_dates": calendar_dates,
+            "calendar_truth": calendar_truth,
+            "overlap_prediction_mean": overlap_prediction_mean,
+            "overlap_prediction_std": overlap_prediction_std,
+        }
+        if mc_lowers is not None and mc_uppers is not None:
+            payload["mc_lower_by_seed"] = first_window_mc_lowers
+            payload["mc_upper_by_seed"] = first_window_mc_uppers
+            payload["mc_lower_mean"] = first_window_mc_lowers.mean(axis=0)
+            payload["mc_upper_mean"] = first_window_mc_uppers.mean(axis=0)
+            payload["window_mc_lower_by_seed"] = mc_lowers
+            payload["window_mc_upper_by_seed"] = mc_uppers
+        np.savez_compressed(prediction_dir / f"{output_stem}.npz", **payload)
+
+        rolling_predictions.setdefault(horizon, {})[model_name] = predictions
+        rolling_truths[horizon] = truths[0]
+        rolling_dates[horizon] = dates.tolist()
+        rolling_seeds[horizon] = seeds
+
+    for horizon, model_predictions in sorted(rolling_predictions.items()):
+        if rolling_truths[horizon].shape[0] <= 1:
+            continue
+        plot_all_rolling_windows(
+            first_window_dates=rolling_dates[horizon],
+            truth_windows=rolling_truths[horizon],
+            predictions_by_model=model_predictions,
+            horizon=horizon,
+            seeds=rolling_seeds[horizon],
+            out_path=figure_dir / f"all_windows_h{horizon}_5seed_mean.png",
+        )
 
     metrics = pd.DataFrame(rows)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,17 +945,31 @@ def run(args: argparse.Namespace) -> None:
     summary = (
         metrics.groupby(["model", "horizon"], as_index=False)
         .agg(
-            mse_mean=("mse", "mean"),
-            mse_std=("mse", "std"),
-            mae_mean=("mae", "mean"),
-            mae_std=("mae", "std"),
+            normalized_mse_mean=("normalized_mse", "mean"),
+            normalized_mse_std=("normalized_mse", "std"),
+            normalized_mae_mean=("normalized_mae", "mean"),
+            normalized_mae_std=("normalized_mae", "std"),
+            mse_kw2_mean=("mse_kw2", "mean"),
+            mse_kw2_std=("mse_kw2", "std"),
+            mae_kw_mean=("mae_kw", "mean"),
+            mae_kw_std=("mae_kw", "std"),
+            rmse_kw_mean=("rmse_kw", "mean"),
+            rmse_kw_std=("rmse_kw", "std"),
+            picp_80_mean=("picp_80", "mean"),
+            picp_80_std=("picp_80", "std"),
+            mpiw_80_kw_mean=("mpiw_80_kw", "mean"),
+            mpiw_80_kw_std=("mpiw_80_kw", "std"),
             runs=("seed", "count"),
+            fit_windows=("fit_windows", "first"),
+            val_windows=("val_windows", "first"),
             test_windows=("test_windows", "first"),
+            mc_samples=("mc_samples", "first"),
         )
-        .sort_values(["horizon", "mse_mean"])
+        .sort_values(["horizon", "normalized_mse_mean"])
     )
     summary_path = output_dir / "summary.csv"
     summary.to_csv(summary_path, index=False)
+    plot_summary_table(summary, figure_dir / "summary_results.png")
     write_report(summary, metrics, Path(args.report_path))
 
     print(f"Wrote {metrics_path}")
@@ -537,6 +1002,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--mc-samples", type=int, default=30)
     parser.add_argument("--device", default="")
     return parser.parse_args()
 
